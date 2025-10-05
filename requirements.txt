@@ -25,7 +25,7 @@ typing_extensions==4.15.0
 typing-inspection==0.4.2
 StrEnum==0.4.15
 
-# --- Security/crypto (for JWT, etc.) ---
+# --- Security/crypto ---
 PyJWT==2.10.1
 cryptography==46.0.2
 cffi>=1.16.0
