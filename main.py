@@ -2,19 +2,48 @@ import os
 from datetime import datetime
 from typing import List, Optional, Literal, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+from itsdangerous import URLSafeSerializer
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, constr
 
-# (선택) .env 로컬 개발 시만 필요 — Render에서는 Environment에 넣으면 자동 주입
+# ────────────────────────────────────────────────────────────
+# Env
+# ────────────────────────────────────────────────────────────
 try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
+    load_dotenv()  # 로컬 개발 시에만 의미 있음 (Render는 Dashboard 환경변수 사용)
 except Exception:
     pass
 
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
 # ────────────────────────────────────────────────────────────
-# Supabase: 환경변수로 초기화. 없으면 None(엔드포인트는 정상 동작, 로그만 패스)
+# FastAPI
+# ────────────────────────────────────────────────────────────
+app = FastAPI(title="Backend API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # 운영에서는 허용 도메인만 지정 권장
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 세션 (구글 로그인에 필요)
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=60*60*24*7)
+
+templates = Jinja2Templates(directory="templates")
+
+# ────────────────────────────────────────────────────────────
+# Supabase (옵셔널)
 # ────────────────────────────────────────────────────────────
 supabase = None
 try:
@@ -22,77 +51,120 @@ try:
     SUPABASE_URL = os.getenv("SUPABASE_URL")
     SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
     if SUPABASE_URL and SUPABASE_KEY:
-        supabase: Optional["Client"] = create_client(SUPABASE_URL, SUPABASE_KEY)
-    else:
-        supabase = None
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)  # type: ignore
 except Exception:
     supabase = None
 
 # ────────────────────────────────────────────────────────────
-# FastAPI & CORS
+# Google OAuth (Authlib)
 # ────────────────────────────────────────────────────────────
-app = FastAPI(title="Backend API", version="0.1.0")
+from authlib.integrations.starlette_client import OAuth
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],     # 운영에서는 허용 도메인만 넣으세요
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+oauth = OAuth()
+oauth.register(
+    name="google",
+    client_id=GOOGLE_CLIENT_ID or "",
+    client_secret=GOOGLE_CLIENT_SECRET or "",
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile", "prompt": "select_account"},
 )
 
+state_signer = URLSafeSerializer(SECRET_KEY, salt="oauth-state")
+
 # ────────────────────────────────────────────────────────────
-# 기존 엔드포인트 (그대로 유지)
+# 기본 페이지
 # ────────────────────────────────────────────────────────────
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    user = request.session.get("user")
+    return templates.TemplateResponse("login.html", {"request": request, "user": user})
+
+@app.get("/login")
+async def login(request: Request):
+    redirect_uri = f"{BASE_URL.rstrip('/')}/auth/google/callback"  # ← 경로 통일 + rstrip로 슬래시 중복 방지
+    state = state_signer.dumps({"next": request.query_params.get("next", "/profile")})
+    return await oauth.google.authorize_redirect(request, redirect_uri, state=state)
+
+@app.get("/auth/google/callback")
+async def auth_callback(request: Request):
+    raw_state = request.query_params.get("state")
+    try:
+        parsed = state_signer.loads(raw_state) if raw_state else {"next": "/profile"}
+    except Exception:
+        return RedirectResponse(url="/?error=invalid_state")
+
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        userinfo = token.get("userinfo")
+        if not userinfo:
+            resp = await oauth.google.parse_id_token(request, token)
+            userinfo = resp
+    except Exception:
+        return RedirectResponse(url="/?error=oauth_error")
+
+    request.session["user"] = {
+        "sub": userinfo.get("sub"),
+        "email": userinfo.get("email"),
+        "name": userinfo.get("name"),
+        "picture": userinfo.get("picture"),
+    }
+    return RedirectResponse(url=parsed.get("next", "/profile"))
+
+@app.get("/profile", response_class=HTMLResponse)
+def profile_page(request: Request):
+    user = request.session.get("user")
+    if not user:
+        return RedirectResponse(url="/")
+    return templates.TemplateResponse("profile.html", {"request": request, "user": user})
+
+@app.get("/me")
+def me_api(request: Request):
+    user = request.session.get("user")
+    if not user:
+        return JSONResponse({"authenticated": False}, status_code=401)
+    return {"authenticated": True, "user": user}
+
+@app.get("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/")
+
+# ────────────────────────────────────────────────────────────
+# 기존 API (Supabase 사용 예시들)
+# ────────────────────────────────────────────────────────────
+@app.get("/tables")
 def get_tables_list():
-    """
-    데이터베이스의 public 스키마에 있는 테이블 목록을 조회합니다 (Supabase RPC: get_public_tables).
-    """
     if not supabase:
         return {"warning": "Supabase not configured", "data": []}
     try:
-        response = supabase.rpc("get_public_tables").execute()
-        return response.data
+        resp = supabase.rpc("get_public_tables").execute()
+        return resp.data
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/profiles")
 def get_profiles():
-    """
-    'profiles' 테이블에서 모든 사용자 프로필을 조회합니다.
-    """
     if not supabase:
         return {"warning": "Supabase not configured", "data": []}
     try:
-        response = supabase.table("profiles").select("*").execute()
-        return response.data
+        resp = supabase.table("profiles").select("*").execute()
+        return resp.data
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/products/{product_id}")
 def get_product(product_id: int):
-    """
-    'products' 테이블에서 특정 ID의 제품을 조회합니다.
-    """
     if not supabase:
         return {"warning": "Supabase not configured", "data": None}
     try:
-        response = (
-            supabase.table("products")
-            .select("*")
-            .eq("id", product_id)
-            .single()
-            .execute()
-        )
-        return response.data
+        resp = supabase.table("products").select("*").eq("id", product_id).single().execute()
+        return resp.data
     except Exception as e:
         return {"error": str(e)}
 
 # ────────────────────────────────────────────────────────────
-# 새로 요청하신 4개 엔드포인트 (모델 + 로직 + API)
+# 분석 엔드포인트 (요청하신 4개 요약)
 # ────────────────────────────────────────────────────────────
-
 Undertone = Literal["cool", "warm", "neutral"]
 SkinType = Literal["dry", "oily", "combination", "sensitive", "normal"]
 
@@ -111,9 +183,7 @@ class PersonalColorResult(BaseModel):
 class SensitivityRequest(BaseModel):
     user_id: Optional[str] = None
     skin_type: Optional[SkinType] = None
-    ingredients_reactions: List[constr(strip_whitespace=True, min_length=1)] = Field(
-        default_factory=list
-    )
+    ingredients_reactions: List[constr(strip_whitespace=True, min_length=1)] = Field(default_factory=list)
     fragrance_sensitive: bool = False
     acne_prone: bool = False
 
@@ -133,7 +203,6 @@ class ComprehensiveResult(BaseModel):
     sensitivity: Optional[SensitivityResult] = None
     recommendations: Dict[str, Any] = {}
 
-# 내부 로직
 def infer_undertone(req: PersonalColorRequest) -> Undertone:
     if req.undertone_hint in ("cool", "warm", "neutral"):
         return req.undertone_hint  # type: ignore
@@ -213,12 +282,10 @@ def save_log(kind: str, user_id: Optional[str], payload: dict, result: dict) -> 
     except Exception:
         pass
 
-# ① Health
 @app.get("/api/v1/analysis/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
-# ② Personal Color
 @app.post("/api/v1/analysis/personal-color", response_model=PersonalColorResult)
 def api_personal_color(req: PersonalColorRequest):
     try:
@@ -228,7 +295,6 @@ def api_personal_color(req: PersonalColorRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ③ Sensitivity
 @app.post("/api/v1/analysis/sensitivity", response_model=SensitivityResult)
 def api_sensitivity(req: SensitivityRequest):
     try:
@@ -238,7 +304,6 @@ def api_sensitivity(req: SensitivityRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# ④ Comprehensive
 @app.post("/api/v1/analysis/comprehensive", response_model=ComprehensiveResult)
 def api_comprehensive(req: ComprehensiveRequest):
     try:
