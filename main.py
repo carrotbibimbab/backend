@@ -10,6 +10,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from itsdangerous import URLSafeSerializer
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, constr
+from fastapi.routing import APIRoute
 
 # ────────────────────────────────────────────────────────────
 # Env
@@ -128,6 +129,12 @@ def me_api(request: Request):
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse(url="/")
+
+# --- app 관련 라우트들 아래쪽(예: /logout 다음)에 추가 ---
+@app.get("/__routes", tags=["debug"])
+def list_routes():
+    # 앱에 등록된 실제 경로만 보기 좋게 정리
+    return sorted([r.path for r in app.routes if isinstance(r, APIRoute)])
 
 # ────────────────────────────────────────────────────────────
 # 기존 API (Supabase 사용 예시들)
