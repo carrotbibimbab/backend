@@ -1,8 +1,8 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta  # ← datetime 유지 + timedelta 추가
 from typing import List, Optional, Literal, Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends  # ← Depends 포함
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
@@ -11,6 +11,8 @@ from itsdangerous import URLSafeSerializer
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, constr
 from fastapi.routing import APIRoute
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials  # ← 추가
+import jwt  # ← 추가 (PyJWT)
 
 # ────────────────────────────────────────────────────────────
 # Env
