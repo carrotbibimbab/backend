@@ -75,6 +75,52 @@ oauth.register(
 state_signer = URLSafeSerializer(SECRET_KEY, salt="oauth-state")
 
 # ────────────────────────────────────────────────────────────
+# JWT 발급/검증 (우리 서버용)
+# ────────────────────────────────────────────────────────────
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+
+def create_access_token(subject: dict, expires_minutes: int | None = None) -> str:
+    """우리 서버용 액세스 토큰 발급 (PyJWT)"""
+    exp = datetime.utcnow() + timedelta(minutes=expires_minutes or ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode = {"exp": exp, **subject}
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    """우리 서버용 액세스 토큰 검증 (PyJWT)"""
+    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+_bearer = HTTPBearer(auto_error=False)
+
+def get_current_user(request: Request, creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
+    """
+    보호 라우트에서 호출되는 공용 의존성.
+    1) Authorization: Bearer <JWT> 있으면 → JWT 검증해서 사용자 리턴
+    2) 없으면 세션 로그인 사용자(request.session['user'])를 대체로 허용
+    """
+    # 1) Authorization 헤더 우선 (앱/클라이언트 사용)
+    if creds and creds.scheme.lower() == "bearer":
+        try:
+            payload = decode_token(creds.credentials)
+            # 우리 JWT는 발급 시 user 정보를 그대로 넣음
+            return {
+                "sub": payload.get("sub"),
+                "email": payload.get("email"),
+                "name": payload.get("name"),
+                "picture": payload.get("picture"),
+            }
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # 2) 세션 로그인(브라우저 사용)
+    user = request.session.get("user")
+    if user:
+        return user
+
+    # 둘 다 없으면 미인증
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
+# ────────────────────────────────────────────────────────────
 # 기본 페이지
 # ────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
@@ -131,6 +177,43 @@ def me_api(request: Request):
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse(url="/")
+
+# ────────────────────────────────────────────────────────────
+# 우리 JWT 발급 / 검증 라우트
+# ────────────────────────────────────────────────────────────
+@app.post("/auth/google/jwt")
+def issue_our_jwt(request: Request):
+    """
+    (사용 시나리오)
+    - 브라우저에서 구글 로그인(세션 저장) 완료 후 앱으로 토큰 전달하거나,
+    - 앱이 /login → /auth/google/callback 흐름을 밟은 후에 JWT가 필요할 때 호출.
+    동작: 세션에 저장된 user로 우리 JWT를 발급해 줍니다.
+    """
+    user = request.session.get("user")
+    if not user:
+        # 세션이 없으면, 프런트에서 받아온 Google ID Token을 검증해서 발급하는 방식으로 바꿔도 됨
+        # (현재 구조 유지 위해, 세션 기반으로만 발급)
+        raise HTTPException(status_code=401, detail="Login required (session)")
+
+    token = create_access_token(
+        {
+            "sub": user.get("sub"),
+            "email": user.get("email"),
+            "name": user.get("name"),
+            "picture": user.get("picture"),
+            "provider": "google",
+        }
+    )
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.get("/me-jwt")
+def me_jwt(user: dict = Depends(get_current_user)):
+    """
+    보호 엔드포인트 예시.
+    - 앱: Authorization: Bearer <our JWT> 로 접근
+    - 브라우저: 세션으로도 접근 가능 (위 get_current_user가 세션도 허용)
+    """
+    return {"authenticated": True, "user": user}
 
 # --- app 관련 라우트들 아래쪽(예: /logout 다음)에 추가 ---
 @app.get("/__routes", tags=["debug"])
