@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, constr
 from fastapi.routing import APIRoute
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials  # ← 추가
 import jwt  # ← 추가 (PyJWT)
+import httpx
 
 # ────────────────────────────────────────────────────────────
 # Env
@@ -31,6 +32,14 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 # FastAPI
 # ────────────────────────────────────────────────────────────
 app = FastAPI(title="Backend API", version="0.1.0")
+
+# ✅ CORS 허용 (개발용 localhost:7357 전용)
+origins = [
+    "http://localhost:7357",
+    "http://127.0.0.1:7357",
+    # 나중에 배포된 프론트 주소를 여기에 추가하세요.
+    # "https://frontend-yourapp.web.app",
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -206,6 +215,42 @@ def issue_our_jwt(request: Request):
     )
     return {"access_token": token, "token_type": "bearer"}
 
+# Google Access Token을 받아 우리 JWT로 교환 (웹용)
+class GoogleAccessTokenIn(BaseModel):
+    access_token: str
+
+@app.post("/auth/google/access-token")
+async def login_with_google_access_token(body: GoogleAccessTokenIn):
+    """
+    Flutter 웹에서 google_sign_in이 idToken을 주지 않는 경우가 있어
+    access_token으로 Google userinfo를 조회/검증하고 우리 JWT를 발급합니다.
+    """
+    # 1) Google userinfo로 access_token 검증 + 프로필 조회
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {body.access_token}"}
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid Google access token")
+
+    info = resp.json()  # {sub, email, email_verified, name, picture, ...}
+    email = info.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email not provided by Google")
+
+    # 2) 우리 서버의 JWT 발급
+    user = {
+        "sub": info.get("sub"),
+        "email": email,
+        "name": info.get("name"),
+        "picture": info.get("picture"),
+        "provider": "google",
+    }
+    token = create_access_token(user)
+    return {"access_token": token, "token_type": "bearer"}
+
 @app.get("/me-jwt")
 def me_jwt(user: dict = Depends(get_current_user)):
     """
@@ -214,6 +259,7 @@ def me_jwt(user: dict = Depends(get_current_user)):
     - 브라우저: 세션으로도 접근 가능 (위 get_current_user가 세션도 허용)
     """
     return {"authenticated": True, "user": user}
+
 
 # --- app 관련 라우트들 아래쪽(예: /logout 다음)에 추가 ---
 @app.get("/__routes", tags=["debug"])
